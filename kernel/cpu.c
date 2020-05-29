@@ -489,6 +489,86 @@ EXPORT_SYMBOL_GPL(cpu_hotplug_enable);
  */
 void __weak arch_smt_update(void) { }
 
+#ifdef CONFIG_HOTPLUG_SMT
+enum cpuhp_smt_control cpu_smt_control __read_mostly = CPU_SMT_ENABLED;
+EXPORT_SYMBOL_GPL(cpu_smt_control);
+
+static bool cpu_smt_available __read_mostly;
+
+void __init cpu_smt_disable(bool force)
+{
+	if (cpu_smt_control == CPU_SMT_FORCE_DISABLED ||
+		cpu_smt_control == CPU_SMT_NOT_SUPPORTED)
+		return;
+
+	if (force) {
+		pr_info("SMT: Force disabled\n");
+		cpu_smt_control = CPU_SMT_FORCE_DISABLED;
+	} else {
+		pr_info("SMT: disabled\n");
+		cpu_smt_control = CPU_SMT_DISABLED;
+	}
+}
+
+/*
+ * The decision whether SMT is supported can only be done after the full
+ * CPU identification. Called from architecture code before non boot CPUs
+ * are brought up.
+ */
+void __init cpu_smt_check_topology_early(void)
+{
+	if (!topology_smt_supported())
+		cpu_smt_control = CPU_SMT_NOT_SUPPORTED;
+}
+
+/*
+ * If SMT was disabled by BIOS, detect it here, after the CPUs have been
+ * brought online. This ensures the smt/l1tf sysfs entries are consistent
+ * with reality. cpu_smt_available is set to true during the bringup of non
+ * boot CPUs when a SMT sibling is detected. Note, this may overwrite
+ * cpu_smt_control's previous setting.
+ */
+void __init cpu_smt_check_topology(void)
+{
+	if (!cpu_smt_available)
+		cpu_smt_control = CPU_SMT_NOT_SUPPORTED;
+}
+
+static int __init smt_cmdline_disable(char *str)
+{
+	cpu_smt_disable(str && !strcmp(str, "force"));
+	return 0;
+}
+early_param("nosmt", smt_cmdline_disable);
+
+static inline bool cpu_smt_allowed(unsigned int cpu)
+{
+	if (topology_is_primary_thread(cpu))
+		return true;
+
+	/*
+	 * If the CPU is not a 'primary' thread and the booted_once bit is
+	 * set then the processor has SMT support. Store this information
+	 * for the late check of SMT support in cpu_smt_check_topology().
+	 */
+	if (per_cpu(cpuhp_state, cpu).booted_once)
+		cpu_smt_available = true;
+
+	if (cpu_smt_control == CPU_SMT_ENABLED)
+		return true;
+
+	/*
+	 * On x86 it's required to boot all logical CPUs at least once so
+	 * that the init code can get a chance to set CR4.MCE on each
+	 * CPU. Otherwise, a broadacasted MCE observing CR4.MCE=0b on any
+	 * core will shutdown the machine.
+	 */
+	return !per_cpu(cpuhp_state, cpu).booted_once;
+}
+#else
+static inline bool cpu_smt_allowed(unsigned int cpu) { return true; }
+#endif
+
 /* Need to know about CPUs going up/down? */
 int register_cpu_notifier(struct notifier_block *nb)
 {
