@@ -846,111 +846,133 @@ restore_cpus:
 	return err;
 }
 
-int cpu_down(unsigned int cpu)
+static int cpu_down_maps_locked(unsigned int cpu, enum cpuhp_state target)
+{
+	if (cpu_hotplug_disabled)
+		return -EBUSY;
+	return _cpu_down(cpu, 0, target);
+}
+
+static int do_cpu_down(unsigned int cpu, enum cpuhp_state target)
 {
 	int err;
 
 	cpu_maps_update_begin();
-
-	if (cpu_hotplug_disabled) {
-		err = -EBUSY;
-		goto out;
-	}
-
-	err = _cpu_down(cpu, 0);
-
-out:
+	err = cpu_down_maps_locked(cpu, target);
 	cpu_maps_update_done();
 	return err;
+}
+int cpu_down(unsigned int cpu)
+{
+	return do_cpu_down(cpu, CPUHP_OFFLINE);
 }
 EXPORT_SYMBOL(cpu_down);
 #endif /*CONFIG_HOTPLUG_CPU*/
 
-/*
- * Unpark per-CPU smpboot kthreads at CPU-online time.
+/**
+ * notify_cpu_starting(cpu) - Invoke the callbacks on the starting CPU
+ * @cpu: cpu that just started
+ *
+ * It must be called by the arch code on the new cpu, before the new cpu
+ * enables interrupts and before the "boot" cpu returns from __cpu_up().
  */
-static int smpboot_thread_call(struct notifier_block *nfb,
-			       unsigned long action, void *hcpu)
+void notify_cpu_starting(unsigned int cpu)
 {
-	int cpu = (long)hcpu;
+	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+	enum cpuhp_state target = min((int)st->target, CPUHP_AP_ONLINE);
 
-	switch (action & ~CPU_TASKS_FROZEN) {
-
-	case CPU_DOWN_FAILED:
-	case CPU_ONLINE:
-		smpboot_unpark_threads(cpu);
-		break;
-
-	default:
-		break;
+	rcu_cpu_starting(cpu);	/* Enables RCU usage on this CPU. */
+	st->booted_once = true;
+	while (st->state < target) {
+		st->state++;
+		cpuhp_invoke_callback(cpu, st->state, true, NULL);
 	}
-
-	return NOTIFY_OK;
 }
 
-static struct notifier_block smpboot_thread_notifier = {
-	.notifier_call = smpboot_thread_call,
-	.priority = CPU_PRI_SMPBOOT,
-};
-
-void smpboot_thread_init(void)
+/*
+ * Called from the idle task. Wake up the controlling task which brings the
+ * hotplug thread of the upcoming CPU up and then delegates the rest of the
+ * online bringup to the hotplug thread.
+ */
+void cpuhp_online_idle(enum cpuhp_state state)
 {
-	register_cpu_notifier(&smpboot_thread_notifier);
+	struct cpuhp_cpu_state *st = this_cpu_ptr(&cpuhp_state);
+
+	/* Happens for the boot cpu */
+	if (state != CPUHP_AP_ONLINE_IDLE)
+		return;
+
+	/*
+	 * Unpart the stopper thread before we start the idle loop (and start
+	 * scheduling); this ensures the stopper task is always available.
+	 */
+	stop_machine_unpark(smp_processor_id());
+
+	st->state = CPUHP_AP_ONLINE_IDLE;
+	complete(&st->done);
 }
 
 /* Requires cpu_add_remove_lock to be held */
-static int _cpu_up(unsigned int cpu, int tasks_frozen)
+static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
 {
-	int ret, nr_calls = 0;
-	void *hcpu = (void *)(long)cpu;
-	unsigned long mod = tasks_frozen ? CPU_TASKS_FROZEN : 0;
+	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
 	struct task_struct *idle;
+	int ret = 0;
 
 	cpu_hotplug_begin();
 
-	if (cpu_online(cpu) || !cpu_present(cpu)) {
+	if (!cpu_present(cpu)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	idle = idle_thread_get(cpu);
-	if (IS_ERR(idle)) {
-		ret = PTR_ERR(idle);
-		goto out;
-	}
-
-	ret = smpboot_create_threads(cpu);
-	if (ret)
+	/*
+	 * The caller of do_cpu_up might have raced with another
+	 * caller. Ignore it for now.
+	 */
+	if (st->state >= target)
 		goto out;
 
-	ret = __cpu_notify(CPU_UP_PREPARE | mod, hcpu, -1, &nr_calls);
-	if (ret) {
-		nr_calls--;
-		pr_warn("%s: attempt to bring up CPU %u failed\n",
-			__func__, cpu);
-		goto out_notify;
+	if (st->state == CPUHP_OFFLINE) {
+		/* Let it fail before we try to bring the cpu up */
+		idle = idle_thread_get(cpu);
+		if (IS_ERR(idle)) {
+			ret = PTR_ERR(idle);
+			goto out;
+		}
 	}
 
-	/* Arch-specific enabling code. */
-	ret = __cpu_up(cpu, idle);
+	cpuhp_tasks_frozen = tasks_frozen;
 
-	if (ret != 0)
-		goto out_notify;
-	BUG_ON(!cpu_online(cpu));
+	st->target = target;
+	/*
+	 * If the current CPU state is in the range of the AP hotplug thread,
+	 * then we need to kick the thread once more.
+	 */
+	if (st->state > CPUHP_BRINGUP_CPU) {
+		ret = cpuhp_kick_ap_work(cpu);
+		/*
+		 * The AP side has done the error rollback already. Just
+		 * return the error code..
+		 */
+		if (ret)
+			goto out;
+	}
 
-	/* Now call notifier in preparation. */
-	cpu_notify(CPU_ONLINE | mod, hcpu);
-
-out_notify:
-	if (ret != 0)
-		__cpu_notify(CPU_UP_CANCELED | mod, hcpu, nr_calls, NULL);
+	/*
+	 * Try to reach the target state. We max out on the BP at
+	 * CPUHP_BRINGUP_CPU. After that the AP hotplug thread is
+	 * responsible for bringing it up to the target state.
+	 */
+	target = min((int)target, CPUHP_BRINGUP_CPU);
+	ret = cpuhp_up_callbacks(cpu, st, target);
 out:
 	cpu_hotplug_done();
 	arch_smt_update();
 	return ret;
 }
 
-int cpu_up(unsigned int cpu)
+static int do_cpu_up(unsigned int cpu, enum cpuhp_state target)
 {
 	int err = 0;
 
@@ -974,11 +996,16 @@ int cpu_up(unsigned int cpu)
 		goto out;
 	}
 
-	err = _cpu_up(cpu, 0);
+	err = _cpu_down(cpu, 0);
 
 out:
 	cpu_maps_update_done();
 	return err;
+}
+
+int cpu_up(unsigned int cpu)
+{
+        return do_cpu_up(cpu, CPUHP_ONLINE);
 }
 EXPORT_SYMBOL_GPL(cpu_up);
 
